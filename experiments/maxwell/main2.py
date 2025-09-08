@@ -243,68 +243,105 @@ class MultiPINNNetwork(nn.Module):
                 all_params.append(params)
         return all_params
     
-    def prune_neurons(self, importance_threshold=0.7):
-        """Prune neurons with low importance"""
-        pruned_count = 0
-        active_neurons = []
+    def aggressive_prune_neurons(self, target_neurons=2):
+        """Aggressively prune to keep only the most important neurons"""
+        all_params = self.get_all_neuron_parameters()
         
-        print(f"\n{'Layer':<8} {'Neuron':<8} {'ID':<5} {'Importance':<12} {'E':<12} {'η':<12} {'τ':<12} {'Status':<10}")
-        print("-" * 85)
+        # Sort by importance
+        sorted_params = sorted(all_params, key=lambda x: x['importance'], reverse=True)
         
-        for layer_idx, layer in enumerate(self.layers):
-            for neuron_idx, neuron in enumerate(layer):
-                params = neuron.get_physics_parameters()
-                importance = params['importance']
-                
-                status = "ACTIVE" if importance > importance_threshold else "PRUNED"
-                if importance <= importance_threshold:
-                    # Set importance to zero (soft pruning)
-                    with torch.no_grad():
-                        neuron.importance.data = torch.tensor([-10.0])  # Very low importance
-                    pruned_count += 1
-                else:
-                    active_neurons.append(params)
-                
-                print(f"{layer_idx:<8} {neuron_idx:<8} {params['neuron_id']:<5} "
-                      f"{importance:<12.4f} {params['E']:<12.2e} {params['eta']:<12.2e} "
-                      f"{params['tau']:<12.4e} {status:<10}")
+        print(f"\n{'Rank':<6} {'Layer':<8} {'Neuron':<8} {'ID':<5} {'Importance':<12} {'E':<12} {'η':<12} {'τ':<12} {'Status':<10}")
+        print("-" * 95)
         
-        active_count = self.total_neurons - pruned_count
-        print(f"\nPruning Summary:")
-        print(f"Total neurons: {self.total_neurons}")
-        print(f"Active neurons: {active_count}")
+        kept_count = 0
+        for i, params in enumerate(sorted_params):
+            layer_idx = params['layer']
+            neuron_idx = params['position']
+            neuron = self.layers[layer_idx][neuron_idx]
+            
+            if kept_count < target_neurons:
+                status = "KEPT"
+                kept_count += 1
+            else:
+                status = "PRUNED"
+                # Aggressively set importance to very low value
+                with torch.no_grad():
+                    neuron.importance.data = torch.tensor([-20.0])
+            
+            print(f"{i+1:<6} {params['layer']:<8} {params['position']:<8} {params['neuron_id']:<5} "
+                  f"{params['importance']:<12.4f} {params['E']:<12.2e} {params['eta']:<12.2e} "
+                  f"{params['tau']:<12.4e} {status:<10}")
+        
+        pruned_count = len(all_params) - target_neurons
+        print(f"\nAggressive Pruning Summary:")
+        print(f"Total neurons: {len(all_params)}")
+        print(f"Kept neurons: {target_neurons}")
         print(f"Pruned neurons: {pruned_count}")
-        print(f"Pruning ratio: {pruned_count/self.total_neurons:.2%}")
+        print(f"Pruning ratio: {pruned_count/len(all_params):.2%}")
         
-        return active_neurons, pruned_count, active_count
+        # Return kept neurons
+        kept_neurons = sorted_params[:target_neurons]
+        return kept_neurons, pruned_count, target_neurons
     
-    def physics_loss(self, x, y_pred, y_true):
-        """Compute combined physics loss from active neurons"""
+    def physics_loss(self, x, y_pred, y_true, sparsity_weight=0.01):
+        """Compute combined physics loss with sparsity regularization"""
         total_mse = nn.MSELoss()(y_pred, y_true)
         total_physics = torch.tensor(0.0, device=x.device, requires_grad=True)
-        active_count = 0
         
+        # Compute physics loss from all neurons (no threshold)
         for layer in self.layers:
             for neuron in layer:
                 importance = torch.sigmoid(neuron.importance).to(x.device)
-                if importance > 0.7:  # Only consider important neurons
-                    neuron_pred = neuron(x)
-                    _, physics_loss = neuron.physics_loss(x, neuron_pred, y_true)
-                    total_physics = total_physics + importance * physics_loss
-                    active_count += 1
+                neuron_pred = neuron(x)
+                _, physics_loss = neuron.physics_loss(x, neuron_pred, y_true)
+                total_physics = total_physics + importance * physics_loss
         
-        if active_count > 0:
-            total_physics = total_physics / active_count
+        # Add sparsity regularization
+        sparsity_loss = self.compute_sparsity_loss(sparsity_weight)
         
-        return total_mse, total_physics
+        return total_mse, total_physics, sparsity_loss
+    
+    def compute_sparsity_loss(self, weight=0.01):
+        """Encourage sparsity by penalizing many active neurons"""
+        # Get device from first layer's first neuron
+        device = next(self.parameters()).device
+        
+        # L1 penalty on importance weights (encourages sparsity)
+        l1_importance = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Group lasso penalty (encourages layer-wise sparsity)
+        group_penalty = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        for layer in self.layers:
+            layer_importances = []
+            for neuron in layer:
+                importance = torch.sigmoid(neuron.importance).to(device)
+                l1_importance = l1_importance + importance
+                layer_importances.append(importance)
+            
+            # Encourage each layer to have few active neurons
+            if layer_importances:
+                layer_stack = torch.stack(layer_importances)
+                group_penalty = group_penalty + torch.sqrt(torch.sum(layer_stack**2))
+        
+        # Target penalty: encourage exactly 2 neurons total
+        total_importance = torch.sum(torch.stack([torch.sigmoid(neuron.importance).to(device) 
+                                                 for layer in self.layers 
+                                                 for neuron in layer]))
+        target_penalty = (total_importance - 2.0)**2  # Penalize deviation from 2 active neurons
+        
+        sparsity_loss = weight * (l1_importance + 0.5 * group_penalty + target_penalty)
+        
+        return sparsity_loss
 
 # ============================================
 # PART 3: TRAINING AND EVALUATION
 # ============================================
 
 def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001, 
-                           device='cpu', model_name='MultiPINN', physics_weight=0.1):
-    """Train a Multi-PINN Network and return training history"""
+                           device='cpu', model_name='MultiPINN', physics_weight=0.1, 
+                           sparsity_weight=0.01):
+    """Train a Multi-PINN Network with sparsity regularization"""
     
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -314,7 +351,9 @@ def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001,
     val_losses = []
     physics_losses = []
     data_losses = []
+    sparsity_losses = []
     importance_history = []
+    active_neuron_history = []
     
     for epoch in range(epochs):
         # Training
@@ -322,6 +361,7 @@ def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001,
         train_loss = 0
         physics_loss_epoch = 0
         data_loss_epoch = 0
+        sparsity_loss_epoch = 0
         
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -329,11 +369,13 @@ def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001,
             optimizer.zero_grad()
             outputs = model(batch_x)
             
-            # Compute physics-informed loss
-            mse_loss, physics_residual = model.physics_loss(batch_x, outputs, batch_y)
+            # Compute all loss components
+            mse_loss, physics_residual, sparsity_loss = model.physics_loss(
+                batch_x, outputs, batch_y, sparsity_weight
+            )
             
             # Combined loss
-            total_loss = mse_loss + physics_weight * physics_residual
+            total_loss = mse_loss + physics_weight * physics_residual + sparsity_loss
             
             total_loss.backward()
             
@@ -345,6 +387,7 @@ def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001,
             train_loss += total_loss.item()
             physics_loss_epoch += physics_residual.item() if hasattr(physics_residual, 'item') else physics_residual
             data_loss_epoch += mse_loss.item()
+            sparsity_loss_epoch += sparsity_loss.item() if hasattr(sparsity_loss, 'item') else sparsity_loss
         
         # Validation
         model.eval()
@@ -353,36 +396,47 @@ def train_multi_pinn_model(model, train_loader, val_loader, epochs=40, lr=0.001,
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
-                mse_loss, physics_residual = model.physics_loss(batch_x, outputs, batch_y)
-                total_loss = mse_loss + physics_weight * physics_residual
+                mse_loss, physics_residual, sparsity_loss = model.physics_loss(
+                    batch_x, outputs, batch_y, sparsity_weight
+                )
+                total_loss = mse_loss + physics_weight * physics_residual + sparsity_loss
                 val_loss += total_loss.item()
         
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
         physics_loss_epoch /= len(train_loader)
         data_loss_epoch /= len(train_loader)
+        sparsity_loss_epoch /= len(train_loader)
         
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         physics_losses.append(physics_loss_epoch)
         data_losses.append(data_loss_epoch)
+        sparsity_losses.append(sparsity_loss_epoch)
         
-        # Track importance evolution
-        if (epoch + 1) % 10 == 0:
+        # Track importance and active neuron evolution
+        if (epoch + 1) % 5 == 0:
             all_params = model.get_all_neuron_parameters()
             avg_importance = np.mean([p['importance'] for p in all_params])
+            active_count = sum(1 for p in all_params if p['importance'] > 0.1)
+            
             importance_history.append(avg_importance)
+            active_neuron_history.append(active_count)
         
         scheduler.step(val_loss)
         
         if (epoch + 1) % 20 == 0:
-            active_neurons = sum(1 for p in model.get_all_neuron_parameters() if p['importance'] > 0.7)
+            active_neurons = sum(1 for p in model.get_all_neuron_parameters() if p['importance'] > 0.1)
+            total_importance = sum(p['importance'] for p in model.get_all_neuron_parameters())
+            
             print(f'{model_name} - Epoch [{epoch+1}/{epochs}], '
                   f'Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, '
-                  f'Physics Loss: {physics_loss_epoch:.6f}, Data Loss: {data_loss_epoch:.6f}, '
-                  f'Active Neurons: {active_neurons}/{model.total_neurons}')
+                  f'Physics: {physics_loss_epoch:.6f}, Data: {data_loss_epoch:.6f}, '
+                  f'Sparsity: {sparsity_loss_epoch:.6f}, '
+                  f'Active: {active_neurons}/{model.total_neurons}, '
+                  f'Total Importance: {total_importance:.2f}')
     
-    return model, train_losses, val_losses, physics_losses, data_losses, importance_history
+    return model, train_losses, val_losses, physics_losses, data_losses, sparsity_losses, importance_history, active_neuron_history
 
 # ============================================
 # PART 4: EXPERIMENT 2 RUNNER
@@ -441,11 +495,12 @@ class Experiment2Runner:
         print(f"\nTraining Multi-PINN Network...")
         print(f"Physics Weight: {physics_weight}")
         
-        # Train the model
-        trained_model, train_losses, val_losses, physics_losses, data_losses, importance_history = train_multi_pinn_model(
+        # Train the model with sparsity regularization
+        trained_model, train_losses, val_losses, physics_losses, data_losses, sparsity_losses, importance_history, active_neuron_history = train_multi_pinn_model(
             model, self.train_loader, self.val_loader,
-            epochs=40, lr=0.001, device=self.device,
-            model_name='MultiPINN', physics_weight=physics_weight
+            epochs=60, lr=0.001, device=self.device,
+            model_name='MultiPINN', physics_weight=physics_weight,
+            sparsity_weight=0.1  # Strong sparsity pressure
         )
         
         # Analyze all neurons before pruning
@@ -473,19 +528,19 @@ class Experiment2Runner:
             for batch_x, batch_y in self.test_loader:
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
                 outputs = trained_model(batch_x)
-                mse_loss, physics_residual = trained_model.physics_loss(batch_x, outputs, batch_y)
-                total_loss = mse_loss + physics_weight * physics_residual
+                mse_loss, physics_residual, sparsity_loss = trained_model.physics_loss(batch_x, outputs, batch_y, 0.1)
+                total_loss = mse_loss + physics_weight * physics_residual + sparsity_loss
                 test_loss_before += total_loss.item()
         test_loss_before /= len(self.test_loader)
         
         print(f"\nTest Loss Before Pruning: {test_loss_before:.6f}")
         
-        # Prune the network
+        # Aggressive pruning to target Jeffrey model structure
         print("\n" + "="*60)
-        print("PRUNING ANALYSIS")
+        print("AGGRESSIVE PRUNING TO JEFFREY MODEL (target=2 neurons)")
         print("="*60)
         
-        active_neurons, pruned_count, active_count = trained_model.prune_neurons(importance_threshold=0.7)
+        kept_neurons, aggressive_pruned_count, kept_count = trained_model.aggressive_prune_neurons(target_neurons=2)
         
         # Evaluate after pruning
         trained_model.eval()
@@ -494,8 +549,8 @@ class Experiment2Runner:
             for batch_x, batch_y in self.test_loader:
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
                 outputs = trained_model(batch_x)
-                mse_loss, physics_residual = trained_model.physics_loss(batch_x, outputs, batch_y)
-                total_loss = mse_loss + physics_weight * physics_residual
+                mse_loss, physics_residual, sparsity_loss = trained_model.physics_loss(batch_x, outputs, batch_y, 0.1)
+                total_loss = mse_loss + physics_weight * physics_residual + sparsity_loss
                 test_loss_after += total_loss.item()
         test_loss_after /= len(self.test_loader)
         
@@ -507,8 +562,8 @@ class Experiment2Runner:
         print("ACTIVE NEURONS ANALYSIS")
         print("="*60)
         
-        # Get all neurons with importance > threshold (whether pruned or not)
-        all_active_neurons = [p for p in all_params if p['importance'] > 0.7]
+        # Use the kept neurons from aggressive pruning
+        all_active_neurons = kept_neurons
         
         if all_active_neurons:
             # Group by layer
@@ -543,11 +598,14 @@ class Experiment2Runner:
             'val_losses': val_losses,
             'physics_losses': physics_losses,
             'data_losses': data_losses,
+            'sparsity_losses': sparsity_losses,
             'importance_history': importance_history,
+            'active_neuron_history': active_neuron_history,
             'all_params': all_params,
-            'active_neurons': all_active_neurons,  # Use the corrected active neurons list
-            'pruned_count': pruned_count,
-            'active_count': active_count,
+            'active_neurons': all_active_neurons,
+            'kept_neurons': kept_neurons,
+            'pruned_count': aggressive_pruned_count,
+            'active_count': kept_count,
             'test_loss_before': test_loss_before,
             'test_loss_after': test_loss_after,
             'total_neurons': trained_model.total_neurons
@@ -679,16 +737,19 @@ class Experiment2Runner:
         axes[0, 0].grid(True, alpha=0.3)
         axes[0, 0].set_yscale('log')
         
-        # Plot 2: Active neuron count over time
-        if 'importance_history' in results:
-            importance_epochs = range(0, len(train_losses), 10)[:len(results['importance_history'])]
-            avg_importance = results['importance_history']
+        # Plot 2: Active neuron count evolution
+        if 'active_neuron_history' in results and results['active_neuron_history']:
+            neuron_epochs = range(0, len(train_losses), 5)[:len(results['active_neuron_history'])]
+            active_counts = results['active_neuron_history']
             
-            axes[0, 1].plot(importance_epochs, avg_importance, 'b-', linewidth=2, marker='o')
+            axes[0, 1].plot(neuron_epochs, active_counts, 'g-', linewidth=2, marker='o')
+            axes[0, 1].axhline(y=2, color='red', linestyle='--', label='Target (2 neurons)')
             axes[0, 1].set_xlabel('Epoch')
-            axes[0, 1].set_ylabel('Average Importance')
-            axes[0, 1].set_title('Average Neuron Importance Evolution')
+            axes[0, 1].set_ylabel('Active Neuron Count')
+            axes[0, 1].set_title('Natural Sparsity Evolution')
+            axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].set_ylim(0, results['total_neurons'] + 1)
         
         # Plot 3: Performance comparison
         test_before = results['test_loss_before']
